@@ -1,0 +1,727 @@
+local env = (getgenv and getgenv()) or _G
+if env.TangHub and env.TangHub.detach then
+	pcall(env.TangHub.detach)
+end
+
+local TangHub = { connections = {}, espEntries = {}, restore = {} }
+env.TangHub = TangHub
+
+-- Raw link of the ByteUI library. A local ByteUI.lua in the workspace is used as backup.
+local UI_URL = "https://raw.githubusercontent.com/wspgs/Tangui.02/refs/heads/main/UI-Library0.2"
+
+-- Services.
+local playersService = game:GetService("Players")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local coreGui = game:GetService("CoreGui")
+
+-- Constants.
+local MELEE_FLAG = 2
+local DRAWING_KEYS = { "box", "name", "health", "tracer" }
+local COLOR_PRESETS = {
+	Color3.fromRGB(255, 60, 60),
+	Color3.fromRGB(60, 255, 90),
+	Color3.fromRGB(60, 160, 255),
+	Color3.fromRGB(255, 255, 255),
+	Color3.fromRGB(255, 220, 40),
+	Color3.fromRGB(255, 60, 255),
+}
+
+-- State.
+local localPlayer = playersService.LocalPlayer
+local currentCamera = workspace.CurrentCamera
+local currentTarget = nil
+local statusLabel = nil
+local espErrorLogged = false
+local globalStuff = nil
+
+local settings = {
+	silentAim = false,
+	cameraLock = false,
+	lockNeedsRmb = true,
+	wallCheck = true,
+	teamCheck = true,
+	targetPlayers = true,
+	targetBots = true,
+	aimHead = true,
+	showFov = false,
+	fovRadius = 150,
+	smoothness = 4,
+	esp = false,
+	espBox = true,
+	espName = true,
+	espHealth = true,
+	espTracer = false,
+	espColor = COLOR_PRESETS[1],
+	espOpacity = 50,
+	speedHack = false,
+	walkSpeed = 50,
+	infJump = false,
+	noclip = false,
+}
+
+---Print to the console and the fallback status bar.
+local function log(text)
+	warn("[TangHub] " .. text)
+	if statusLabel then
+		statusLabel.Text = "  " .. text
+	end
+end
+
+---Create an instance with properties.
+local function new(class, props, parent)
+	local instance = Instance.new(class)
+	for key, value in pairs(props) do
+		instance[key] = value
+	end
+	instance.Parent = parent
+	return instance
+end
+
+---Create a ScreenGui in a hidden container.
+local function createGui(name)
+	local gui = new("ScreenGui", { Name = name, ResetOnSpawn = false, DisplayOrder = 999 })
+	local ok = pcall(function()
+		if protect_gui then pcall(protect_gui, gui) end
+		gui.Parent = (gethui and gethui()) or coreGui
+	end)
+	if not ok or not gui.Parent then
+		gui.Parent = localPlayer:WaitForChild("PlayerGui")
+	end
+	return gui
+end
+
+local espGui = createGui("TangHubEsp")
+
+-- Load the game's GlobalStuff module for team checks.
+pcall(function()
+	local modulesFolder = replicatedStorage:WaitForChild("Modules", 5)
+	local moduleScript = modulesFolder and modulesFolder:WaitForChild("GlobalStuff", 5)
+	if not moduleScript then return end
+
+	if setthreadidentity then pcall(setthreadidentity, 2) end
+	local loaded, module = pcall(require, moduleScript)
+	if setthreadidentity then pcall(setthreadidentity, 8) end
+
+	if loaded and type(module) == "table" then
+		globalStuff = module
+	end
+end)
+
+-- Entity helpers (this game keeps characters in Workspace.Entities).
+---Return the local player's entity model.
+local function getLocalEntity()
+	local folder = workspace:FindFirstChild("Entities")
+	return (folder and folder:FindFirstChild(localPlayer.Name)) or localPlayer.Character
+end
+
+---Check whether a model is a bot.
+local function isBot(model)
+	return model.Name:sub(-5) == "__Bot"
+end
+
+---Check whether a model is on our team.
+local function isFriendly(model)
+	local localEntity = getLocalEntity()
+
+	if globalStuff and globalStuff.SameTeam and localEntity then
+		local ok, same = pcall(globalStuff.SameTeam, globalStuff, localEntity, model)
+		if ok then return same == true end
+	end
+
+	local player = playersService:FindFirstChild(model.Name)
+	return player ~= nil and player.Team ~= nil and player.Team == localPlayer.Team
+end
+
+---Return every other entity model.
+local function getEntities()
+	local result = {}
+	local folder = workspace:FindFirstChild("Entities")
+
+	if folder then
+		for _, model in ipairs(folder:GetChildren()) do
+			if model:IsA("Model") and model.Name ~= localPlayer.Name then
+				table.insert(result, model)
+			end
+		end
+		return result
+	end
+
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if player ~= localPlayer and player.Character then
+			table.insert(result, player.Character)
+		end
+	end
+	return result
+end
+
+---Return humanoid and root part if the entity is a valid target.
+local function getValidParts(model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local hrp = model:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and hrp and humanoid.Health > 0) then return end
+
+	local bot = isBot(model)
+	if bot and not settings.targetBots then return end
+	if not bot and not settings.targetPlayers then return end
+
+	if settings.teamCheck and isFriendly(model) then return end
+
+	return humanoid, hrp
+end
+
+---Check line of sight from the camera to a part (ignores entities like the game does).
+local function isVisible(part)
+	local exclude = {}
+	for _, name in ipairs({ "IgnoreThese", "Entities", "EntityFocus", "StaticTargets" }) do
+		local folder = workspace:FindFirstChild(name)
+		if folder then table.insert(exclude, folder) end
+	end
+	if localPlayer.Character then table.insert(exclude, localPlayer.Character) end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = exclude
+
+	local origin = currentCamera.CFrame.Position
+	return workspace:Raycast(origin, part.Position - origin, params) == nil
+end
+
+---Return the entity whose HumanoidRootPart projects closest to the cursor
+---within the FOV radius.
+local function getClosestEntity()
+	local closest, closestDist, candidates = nil, math.huge, {}
+	local mousePos = userInputService:GetMouseLocation()
+
+	for _, model in ipairs(getEntities()) do
+		local humanoid, hrp = getValidParts(model)
+		if hrp then
+			local screenPos, onScreen = currentCamera:WorldToViewportPoint(hrp.Position)
+			if onScreen then
+				local dist = (Vector2.new(screenPos.X, screenPos.Y) - Vector2.new(mousePos.X, mousePos.Y)).Magnitude
+				if dist <= settings.fovRadius then
+					table.insert(candidates, { model = model, dist = dist, screenPos = screenPos })
+				end
+			end
+		end
+	end
+
+	for _, info in ipairs(candidates) do
+		if info.dist < closestDist then
+			closest = info.model
+			closestDist = info.dist
+		end
+	end
+
+	return closest, closestDist, candidates
+end
+
+---Pick the part to aim at.
+local function getAimPart()
+	local model = getClosestEntity()
+	if not model then return end
+
+	local partName = settings.aimHead and "Head" or "HumanoidRootPart"
+	local part = model:FindFirstChild(partName) or model:FindFirstChild("HumanoidRootPart")
+	if not part then return end
+
+	if settings.wallCheck and not isVisible(part) then return end
+	return part
+end
+
+-- Silent aim: redirect the aim direction inside the game's ShotClient module.
+local silentOk, silentError = pcall(function()
+	local entityFolder = replicatedStorage:WaitForChild("Entity", 5)
+	local shotModule = entityFolder and entityFolder:WaitForChild("ShotClient", 5)
+	assert(shotModule, "ShotClient not found")
+
+	-- Drop identity so the module cannot see executor globals.
+	if setthreadidentity then pcall(setthreadidentity, 2) end
+	local loaded, ShotClient = pcall(require, shotModule)
+	if setthreadidentity then pcall(setthreadidentity, 8) end
+	assert(loaded and type(ShotClient) == "table", "require ShotClient failed")
+
+	if isreadonly and isreadonly(ShotClient) then setreadonly(ShotClient, false) end
+
+	local originalPrepare = ShotClient.Prepare
+	local originalAimDirection = ShotClient.AimDirection
+	assert(type(originalPrepare) == "function" and type(originalAimDirection) == "function", "unexpected ShotClient shape")
+
+	ShotClient.Prepare = function(self, weapon, direction, flags)
+		if settings.silentAim and currentTarget and not (flags and bit32.band(flags, MELEE_FLAG) ~= 0) then
+			local origin = ShotClient:Origin()
+			if origin then
+				direction = (currentTarget.Position - origin).Unit
+			end
+		end
+		return originalPrepare(self, weapon, direction, flags)
+	end
+
+	ShotClient.AimDirection = function(self, origin, ...)
+		if settings.silentAim and currentTarget and typeof(origin) == "Vector3" then
+			return (currentTarget.Position - origin).Unit
+		end
+		return originalAimDirection(self, origin, ...)
+	end
+
+	TangHub.restore.shotClient = function()
+		ShotClient.Prepare = originalPrepare
+		ShotClient.AimDirection = originalAimDirection
+	end
+end)
+
+-- Optional Drawing objects.
+local hasDrawing = Drawing ~= nil and Drawing.new ~= nil
+local fovCircle = nil
+if hasDrawing then
+	pcall(function()
+		fovCircle = Drawing.new("Circle")
+		fovCircle.Thickness = 1
+		fovCircle.NumSides = 64
+		fovCircle.Filled = false
+		fovCircle.Color = Color3.new(1, 1, 1)
+	end)
+end
+
+-- ESP.
+---Create ESP objects for an entity.
+local function createEsp(model)
+	local entry = {}
+	entry.highlight = new("Highlight", { DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false }, espGui)
+
+	if hasDrawing then
+		pcall(function()
+			entry.box = Drawing.new("Square")
+			entry.box.Thickness = 1
+			entry.box.Filled = false
+
+			entry.name = Drawing.new("Text")
+			entry.name.Size = 14
+			entry.name.Center = true
+			entry.name.Outline = true
+
+			entry.health = Drawing.new("Line")
+			entry.health.Thickness = 2
+
+			entry.tracer = Drawing.new("Line")
+			entry.tracer.Thickness = 1
+		end)
+	end
+
+	TangHub.espEntries[model] = entry
+end
+
+---Remove ESP objects of an entity.
+local function removeEsp(model)
+	local entry = TangHub.espEntries[model]
+	if not entry then return end
+
+	entry.highlight:Destroy()
+	for _, key in ipairs(DRAWING_KEYS) do
+		if entry[key] then pcall(function() entry[key]:Remove() end) end
+	end
+	TangHub.espEntries[model] = nil
+end
+
+---Hide only the Drawing objects of an entry.
+local function hideDrawings(entry)
+	for _, key in ipairs(DRAWING_KEYS) do
+		if entry[key] then entry[key].Visible = false end
+	end
+end
+
+---Update ESP of an entity.
+local function updateEsp(model, entry)
+	local humanoid, hrp = getValidParts(model)
+	if not settings.esp or not hrp then
+		entry.highlight.Enabled = false
+		hideDrawings(entry)
+		return
+	end
+
+	local color = settings.espColor
+
+	entry.highlight.Adornee = model
+	entry.highlight.FillColor = color
+	entry.highlight.OutlineColor = color
+	entry.highlight.FillTransparency = 1 - settings.espOpacity / 100
+	entry.highlight.Enabled = settings.espBox
+
+	if not entry.box then return end
+
+	local rootPos, onScreen = currentCamera:WorldToViewportPoint(hrp.Position)
+	if not onScreen then
+		hideDrawings(entry)
+		return
+	end
+
+	local topPos = currentCamera:WorldToViewportPoint(hrp.Position + Vector3.new(0, 2.8, 0))
+	local bottomPos = currentCamera:WorldToViewportPoint(hrp.Position - Vector3.new(0, 3, 0))
+	local height = math.abs(bottomPos.Y - topPos.Y)
+	local width = height / 2
+
+	entry.box.Visible = settings.espBox
+	entry.box.Color = color
+	entry.box.Size = Vector2.new(width, height)
+	entry.box.Position = Vector2.new(rootPos.X - width / 2, topPos.Y)
+
+	local distance = math.floor((hrp.Position - currentCamera.CFrame.Position).Magnitude)
+	local displayName = isBot(model) and ("[BOT] " .. model.Name:sub(1, -6)) or model.Name
+	entry.name.Visible = settings.espName
+	entry.name.Color = color
+	entry.name.Text = displayName .. " [" .. distance .. "m]"
+	entry.name.Position = Vector2.new(rootPos.X, topPos.Y - 16)
+
+	local ratio = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+	entry.health.Visible = settings.espHealth
+	entry.health.Color = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), ratio)
+	entry.health.From = Vector2.new(rootPos.X - width / 2 - 4, topPos.Y + height)
+	entry.health.To = Vector2.new(rootPos.X - width / 2 - 4, topPos.Y + height - height * ratio)
+
+	local viewport = currentCamera.ViewportSize
+	entry.tracer.Visible = settings.espTracer
+	entry.tracer.Color = color
+	entry.tracer.From = Vector2.new(viewport.X / 2, viewport.Y)
+	entry.tracer.To = Vector2.new(rootPos.X, rootPos.Y)
+end
+
+---Create missing ESP entries and drop stale ones.
+local function syncEsp()
+	local alive = {}
+	for _, model in ipairs(getEntities()) do
+		alive[model] = true
+		if not TangHub.espEntries[model] then createEsp(model) end
+	end
+	for model in pairs(TangHub.espEntries) do
+		if not alive[model] or not model.Parent then removeEsp(model) end
+	end
+end
+
+-- Main loop.
+local lastSync = 0
+table.insert(TangHub.connections, runService.RenderStepped:Connect(function()
+	currentCamera = workspace.CurrentCamera
+
+	if fovCircle then
+		fovCircle.Visible = settings.showFov
+		fovCircle.Radius = settings.fovRadius
+		fovCircle.Position = userInputService:GetMouseLocation()
+	end
+
+	if os.clock() - lastSync > 0.5 then
+		lastSync = os.clock()
+		pcall(syncEsp)
+	end
+
+	local ok, part = pcall(function()
+		if settings.silentAim or settings.cameraLock then
+			return getAimPart()
+		end
+	end)
+	currentTarget = ok and part or nil
+
+	-- Camera lock (extra aim assist).
+	if settings.cameraLock and currentTarget then
+		local allowed = not settings.lockNeedsRmb or userInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+		if allowed then
+			local goal = CFrame.lookAt(currentCamera.CFrame.Position, currentTarget.Position)
+			currentCamera.CFrame = currentCamera.CFrame:Lerp(goal, 1 / math.max(settings.smoothness, 1))
+		end
+	end
+
+	for model, entry in pairs(TangHub.espEntries) do
+		local espOk, espError = pcall(updateEsp, model, entry)
+		if not espOk and not espErrorLogged then
+			espErrorLogged = true
+			log("ESP error: " .. tostring(espError))
+		end
+	end
+end))
+
+-- Movement.
+table.insert(TangHub.connections, runService.Stepped:Connect(function()
+	local character = getLocalEntity()
+	if not character then return end
+
+	if settings.noclip then
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") then part.CanCollide = false end
+		end
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid and settings.speedHack then
+		humanoid.WalkSpeed = settings.walkSpeed
+	end
+end))
+
+table.insert(TangHub.connections, userInputService.JumpRequest:Connect(function()
+	if not settings.infJump then return end
+
+	local character = getLocalEntity()
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end
+end))
+
+---Clean everything up.
+function TangHub.detach()
+	settings.silentAim = false
+	settings.cameraLock = false
+	for _, restore in pairs(TangHub.restore) do
+		pcall(restore)
+	end
+	for _, connection in ipairs(TangHub.connections) do
+		pcall(function() connection:Disconnect() end)
+	end
+	for model in pairs(TangHub.espEntries) do
+		pcall(removeEsp, model)
+	end
+	if fovCircle then pcall(function() fovCircle:Remove() end) end
+	espGui:Destroy()
+	env.TangHub = nil
+end
+
+-- Menu definition: { kind, name, key, min, max, cycleValues }.
+local MENU = {
+	{ name = "การเล็ง", items = {
+		{ "toggle", "Silent Aim", "silentAim" },
+		{ "keybind", "ปุ่มลัดเปิด/ปิด Silent Aim", "toggleSilent", Enum.KeyCode.X },
+		{ "toggle", "ล็อกกล้องช่วยเล็ง", "cameraLock" },
+		{ "toggle", "ล็อกเฉพาะตอนกดเมาส์ขวา", "lockNeedsRmb" },
+		{ "toggle", "เช็คกำแพง", "wallCheck" },
+		{ "toggle", "ข้ามเพื่อนทีม (เล็ง + ESP)", "teamCheck" },
+		{ "toggle", "เล็งผู้เล่น", "targetPlayers" },
+		{ "toggle", "เล็งบอท", "targetBots" },
+		{ "toggle", "เล็งหัว", "aimHead" },
+		{ "toggle", "แสดงวง FOV", "showFov" },
+		{ "slider", "ขนาดวง FOV", "fovRadius", 30, 500, { 80, 150, 250, 400 } },
+		{ "slider", "ความนุ่มของกล้อง", "smoothness", 1, 20, { 1, 4, 8, 15 } },
+	} },
+	{ name = "ESP", items = {
+		{ "toggle", "เปิด ESP", "esp" },
+		{ "toggle", "ข้ามเพื่อนทีม (เล็ง + ESP)", "teamCheck" },
+		{ "toggle", "ไฮไลต์ตัว / กรอบ", "espBox" },
+		{ "toggle", "ชื่อ / ระยะ", "espName" },
+		{ "toggle", "เลือด", "espHealth" },
+		{ "toggle", "เส้นโยง", "espTracer" },
+		{ "color", "สี ESP", "espColor" },
+		{ "slider", "ความทึบสี (%)", "espOpacity", 0, 100, { 20, 50, 80, 100 } },
+	} },
+	{ name = "ผู้เล่น", items = {
+		{ "toggle", "วิ่งเร็ว", "speedHack" },
+		{ "slider", "ความเร็ววิ่ง", "walkSpeed", 16, 200, { 30, 50, 80, 120 } },
+		{ "toggle", "กระโดดไม่จำกัด", "infJump" },
+		{ "toggle", "ทะลุกำแพง", "noclip" },
+	} },
+	{ name = "ระบบ", items = {
+		{ "button", "ปิดสคริปต์", "unload" },
+	} },
+}
+
+local ACTIONS = {
+	unload = function() TangHub.detach() end,
+	toggleSilent = function()
+		settings.silentAim = not settings.silentAim
+		log("Silent Aim: " .. (settings.silentAim and "เปิด" or "ปิด"))
+	end,
+}
+
+---Advance a setting to the next cycle value.
+local function advanceCycle(item)
+	local key, values = item[3], item[6]
+	local index = 1
+	for position, value in ipairs(values) do
+		if settings[key] == value then
+			index = position % #values + 1
+			break
+		end
+	end
+	settings[key] = values[index]
+	log(item[2] .. " = " .. tostring(settings[key]))
+end
+
+---Advance the ESP color preset.
+local function advanceColor()
+	local index = 1
+	for position, color in ipairs(COLOR_PRESETS) do
+		if settings.espColor == color then
+			index = position % #COLOR_PRESETS + 1
+			break
+		end
+	end
+	settings.espColor = COLOR_PRESETS[index]
+	log("เปลี่ยนสี ESP เป็นตัวที่ " .. index)
+end
+
+---Build the ByteUI menu.
+---@param Library table
+local function buildByteUi(Library)
+	local window = Library.new({ Title = "Tang Hub" })
+
+	for _, tabSpec in ipairs(MENU) do
+		local tab = window:addTab({ Name = tabSpec.name })
+
+		for _, item in ipairs(tabSpec.items) do
+			local kind, name, key = item[1], item[2], item[3]
+
+			local ok, err = pcall(function()
+				if kind == "toggle" then
+					tab:addToggle({ Name = name, Default = settings[key], Callback = function(state) settings[key] = state end })
+				elseif kind == "slider" then
+					tab:addSlider({
+						Name = name, Min = item[4], Max = item[5], Default = settings[key], Increment = 1,
+						Callback = function(value) settings[key] = value end,
+					})
+				elseif kind == "color" then
+					local options = { Name = name, Default = settings[key], Callback = function(color) settings[key] = color end }
+					if tab.addColorpicker then
+						tab:addColorpicker(options)
+					else
+						tab:addColorPicker(options)
+					end
+				elseif kind == "keybind" then
+					tab:addKeybind({ Name = name, Default = item[4], Callback = ACTIONS[key] })
+				elseif kind == "button" then
+					tab:addButton({ Name = name, Callback = ACTIONS[key] })
+				end
+			end)
+
+			if not ok then
+				warn("[TangHub] UI element failed: " .. name .. " | " .. tostring(err))
+			end
+		end
+	end
+
+	window:addSettings()
+	window:addCredits("Tang Hub")
+end
+
+---Build a basic built-in menu when ByteUI cannot load.
+local function buildFallbackUi()
+	local gui = createGui("TangHubMenu")
+	table.insert(TangHub.connections, { Disconnect = function() gui:Destroy() end })
+
+	local main = new("Frame", {
+		Size = UDim2.fromOffset(330, 420), Position = UDim2.fromOffset(30, 80),
+		BackgroundColor3 = Color3.fromRGB(22, 22, 30), BorderSizePixel = 0,
+	}, gui)
+	new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+
+	local title = new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Color3.fromRGB(124, 77, 255), Text = "TANG HUB  (ลากเพื่อย้าย)",
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.SourceSansBold, TextSize = 18,
+	}, main)
+	new("UICorner", { CornerRadius = UDim.new(0, 10) }, title)
+
+	local dragging, dragStart, startPos = false, nil, nil
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, main.Position
+		end
+	end)
+	table.insert(TangHub.connections, userInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end))
+	table.insert(TangHub.connections, userInputService.InputEnded:Connect(function() dragging = false end))
+
+	local list = new("ScrollingFrame", {
+		Size = UDim2.new(1, -12, 1, -66), Position = UDim2.fromOffset(6, 40), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 4, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+	}, main)
+	new("UIListLayout", { Padding = UDim.new(0, 5) }, list)
+
+	statusLabel = new("TextLabel", {
+		Size = UDim2.new(1, -12, 0, 20), Position = UDim2.new(0, 6, 1, -24), BackgroundTransparency = 1, Text = "",
+		TextColor3 = Color3.fromRGB(150, 150, 170), Font = Enum.Font.SourceSans, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+	}, main)
+
+	local function addRow(text, callback)
+		local button = new("TextButton", {
+			Size = UDim2.new(1, -6, 0, 30), BackgroundColor3 = Color3.fromRGB(40, 40, 55), Text = text,
+			TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.SourceSansBold, TextSize = 16,
+		}, list)
+		new("UICorner", { CornerRadius = UDim.new(0, 6) }, button)
+		button.MouseButton1Click:Connect(function() callback(button) end)
+		return button
+	end
+
+	for _, tabSpec in ipairs(MENU) do
+		new("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, Text = "— " .. tabSpec.name .. " —",
+			TextColor3 = Color3.fromRGB(160, 120, 255), Font = Enum.Font.SourceSansBold, TextSize = 16,
+		}, list)
+
+		for _, item in ipairs(tabSpec.items) do
+			local kind, name, key = item[1], item[2], item[3]
+
+			if kind == "toggle" then
+				local function refresh(button)
+					button.Text = name .. (settings[key] and "  :  เปิด" or "  :  ปิด")
+					button.BackgroundColor3 = settings[key] and Color3.fromRGB(40, 120, 60) or Color3.fromRGB(40, 40, 55)
+				end
+				local row = addRow("", function(button)
+					settings[key] = not settings[key]
+					refresh(button)
+				end)
+				refresh(row)
+			elseif kind == "slider" then
+				local row = addRow("", function(button)
+					advanceCycle(item)
+					button.Text = name .. "  :  " .. settings[key]
+				end)
+				row.Text = name .. "  :  " .. settings[key]
+			elseif kind == "color" then
+				local row = addRow(name .. "  (กดเพื่อเปลี่ยนสี)", function(button)
+					advanceColor()
+					button.TextColor3 = settings.espColor
+				end)
+				row.TextColor3 = settings.espColor
+			elseif kind == "button" or kind == "keybind" then
+				addRow(name, ACTIONS[key])
+			end
+		end
+	end
+
+	table.insert(TangHub.connections, userInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
+		if input.KeyCode == Enum.KeyCode.RightShift then
+			main.Visible = not main.Visible
+		elseif input.KeyCode == Enum.KeyCode.X then
+			ACTIONS.toggleSilent()
+		end
+	end))
+end
+
+---Download the ByteUI source, or read it from the workspace file.
+---@return string
+local function fetchLibrarySource()
+	local ok, response = pcall(request, { Url = UI_URL, Method = "GET" })
+	if ok and response and response.Success and response.Body and #response.Body > 0 then
+		return response.Body
+	end
+
+	if isfile and isfile("ByteUI.lua") then
+		return readfile("ByteUI.lua")
+	end
+
+	error("โหลด ByteUI ไม่สำเร็จ (UI_URL ผิด หรือไม่มีไฟล์ ByteUI.lua ใน workspace)")
+end
+
+-- Start the UI.
+local uiOk, uiError = pcall(function()
+	local chunk, compileError = loadstring(fetchLibrarySource())
+	assert(chunk, "ไฟล์ ByteUI คอมไพล์ไม่ผ่าน: " .. tostring(compileError))
+	buildByteUi(chunk())
+end)
+
+if not uiOk then
+	warn("[TangHub] ByteUI: " .. tostring(uiError))
+	buildFallbackUi()
+end
+
+log((uiOk and "ByteUI พร้อม" or "ใช้เมนูสำรอง") .. (silentOk and " | Silent Aim พร้อม" or " | Silent Aim ไม่รองรับ") .. " | Team: " .. (globalStuff and "GlobalStuff" or "Player.Team") .. " | Drawing: " .. tostring(hasDrawing))
+if not silentOk then warn("[TangHub] silent aim: " .. tostring(silentError)) end
